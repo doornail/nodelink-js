@@ -4980,10 +4980,12 @@ export class ReolinkBaichuanApi {
           ? [ch, 0] // wide: some firmwares want logicChannel == camera channel
           : [1]; // tele/autotrack: generally logicChannel=1
 
-      // Try header overrides in priority order. Many NVRs accept only header channelId=0 for snapshots.
+      // Try header overrides in priority order.
+      // For Hub channels > 0, we must try the actual channel first; channelId=0 succeeds but returns
+      // channel 0's image because the Hub routes on the binary header channelId, not XML payload.
       const headerChannelIdOverrideCandidates: Array<number | undefined> = [
-        0,
         ch,
+        0,
         undefined,
       ];
 
