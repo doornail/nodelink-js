@@ -740,6 +740,18 @@ export class ReolinkBaichuanApi {
   /** Periodic session check interval (every 60 seconds). */
   private sessionGuardIntervalTimer: NodeJS.Timeout | undefined;
 
+
+  // NVR SNAPSHOT - param cache + serialization
+  private readonly nvrSnapshotParamCache = new Map<
+    string,
+    {
+      headerChannelIdOverride: number | undefined;
+      channelIdTag: number;
+      logicChannel: number;
+    }
+  >();
+  private nvrSnapshotQueueTail: Promise<void> = Promise.resolve();
+
   private readonly simpleEventListeners = new Set<
     (event: ReolinkSimpleEvent) => void | Promise<void>
   >();
@@ -4974,46 +4986,7 @@ export class ReolinkBaichuanApi {
     // - some expect channelId tags/header channelId to be 0-based (PCAP-observed)
     // - others expect 1-based. Try both when onNvr.
     if (onNvr) {
-      const channelIdTagCandidates = [ch, ch + 1];
-      const logicChannelCandidates =
-        variant === "default"
-          ? [ch, 0] // wide: some firmwares want logicChannel == camera channel
-          : [1]; // tele/autotrack: generally logicChannel=1
-
-      // Try header overrides in priority order.
-      // For Hub channels > 0, we must try the actual channel first; channelId=0 succeeds but returns
-      // channel 0's image because the Hub routes on the binary header channelId, not XML payload.
-      const headerChannelIdOverrideCandidates: Array<number | undefined> = [
-        ch,
-        0,
-        undefined,
-      ];
-
-      let lastErr: unknown;
-      for (const headerChannelIdOverride of headerChannelIdOverrideCandidates) {
-        for (const channelIdTag of channelIdTagCandidates) {
-          for (const lc of logicChannelCandidates) {
-            try {
-              return await this.client.sendBinary({
-                cmdId,
-                channel: ch,
-                ...(headerChannelIdOverride !== undefined
-                  ? { channelIdOverride: headerChannelIdOverride }
-                  : {}),
-                payloadXml: buildSnapXml({ channelIdTag, logicChannel: lc }),
-                extensionXml: buildChannelExtensionXml(channelIdTag),
-                timeoutMs,
-              });
-            } catch (e) {
-              lastErr = e;
-            }
-          }
-        }
-      }
-
-      throw lastErr instanceof Error
-        ? lastErr
-        : new Error(String(lastErr ?? "getSnapshot failed"));
+      return await this.getSnapshotNvr(ch, variant, streamType, cmdId, timeoutMs, buildSnapXml);
     }
 
     return await this.client.sendBinary({
@@ -5023,6 +4996,124 @@ export class ReolinkBaichuanApi {
       extensionXml: buildChannelExtensionXml(ch),
       timeoutMs,
     });
+  }
+
+  /**
+   * NVR/Hub snapshot with serialization, caching, and backoff.
+   *
+   * On NVR firmware, the channel-addressing scheme varies across firmware versions,
+   * so we try multiple combinations of headerChannelId, XML channelIdTag, and logicChannel.
+   * To avoid flooding the Hub (which shares a single TCP connection for all cameras):
+   *
+   * 1. Cache: Once a working combination is found, it is cached per channel+variant.
+   * 2. Serialization: Snapshot requests are queued so only one executes at a time.
+   * 3. Backoff: Failed attempts within the brute-force loop use 500ms delays.
+   */
+  private async getSnapshotNvr(
+    ch: number,
+    variant: NativeVideoStreamVariant,
+    streamType: "main" | "sub",
+    cmdId: number,
+    timeoutMs: number,
+    buildSnapXml: (params: { channelIdTag: number; logicChannel: number }) => string,
+  ): Promise<Buffer> {
+    // Serialize all NVR snapshot requests through a single queue.
+    // This prevents 7 cameras from flooding the Hub simultaneously.
+    const prev = this.nvrSnapshotQueueTail;
+    let resolveQueue!: () => void;
+    this.nvrSnapshotQueueTail = new Promise<void>((r) => { resolveQueue = r; });
+    await prev.catch(() => undefined);
+
+    try {
+      return await this.getSnapshotNvrInner(ch, variant, streamType, cmdId, timeoutMs, buildSnapXml);
+    } finally {
+      resolveQueue();
+    }
+  }
+
+  private async getSnapshotNvrInner(
+    ch: number,
+    variant: NativeVideoStreamVariant,
+    streamType: "main" | "sub",
+    cmdId: number,
+    timeoutMs: number,
+    buildSnapXml: (params: { channelIdTag: number; logicChannel: number }) => string,
+  ): Promise<Buffer> {
+    const cacheKey = `snap:ch${ch}:${variant}`;
+
+    // Fast path: try cached combination first (single attempt, no brute-force)
+    const cached = this.nvrSnapshotParamCache.get(cacheKey);
+    if (cached) {
+      try {
+        return await this.client.sendBinary({
+          cmdId,
+          channel: ch,
+          ...(cached.headerChannelIdOverride !== undefined
+            ? { channelIdOverride: cached.headerChannelIdOverride }
+            : {}),
+          payloadXml: buildSnapXml({
+            channelIdTag: cached.channelIdTag,
+            logicChannel: cached.logicChannel,
+          }),
+          extensionXml: buildChannelExtensionXml(cached.channelIdTag),
+          timeoutMs,
+        });
+      } catch {
+        // Cached combination no longer works -- clear and fall through to brute-force
+        this.nvrSnapshotParamCache.delete(cacheKey);
+      }
+    }
+
+    // Slow path: brute-force discovery with backoff between attempts
+    const channelIdTagCandidates = [ch, ch + 1];
+    const logicChannelCandidates =
+      variant === "default"
+        ? [ch, 0]
+        : [1];
+
+    // For Hub channels > 0, try the actual channel first; channelId=0 succeeds but returns
+    // channel 0 image because the Hub routes on the binary header channelId, not XML payload.
+    const headerChannelIdOverrideCandidates: Array<number | undefined> = [
+      ch,
+      0,
+      undefined,
+    ];
+
+    let lastErr: unknown;
+    for (const headerChannelIdOverride of headerChannelIdOverrideCandidates) {
+      for (const channelIdTag of channelIdTagCandidates) {
+        for (const lc of logicChannelCandidates) {
+          try {
+            const result = await this.client.sendBinary({
+              cmdId,
+              channel: ch,
+              ...(headerChannelIdOverride !== undefined
+                ? { channelIdOverride: headerChannelIdOverride }
+                : {}),
+              payloadXml: buildSnapXml({ channelIdTag, logicChannel: lc }),
+              extensionXml: buildChannelExtensionXml(channelIdTag),
+              timeoutMs,
+            });
+
+            // Success -- cache this combination for future requests
+            this.nvrSnapshotParamCache.set(cacheKey, {
+              headerChannelIdOverride,
+              channelIdTag,
+              logicChannel: lc,
+            });
+            return result;
+          } catch (e) {
+            lastErr = e;
+            // Backoff between attempts to avoid overwhelming the Hub
+            await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+      }
+    }
+
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(String(lastErr ?? "getSnapshot NVR failed"));
   }
 
   /**

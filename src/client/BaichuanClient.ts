@@ -3820,6 +3820,16 @@ export class BaichuanClient extends EventEmitter<{
       const onFrame = (frame: BaichuanFrame) => {
         if (frame.header.cmdId !== cmdId) return;
 
+        // Filter by channelId to prevent cross-talk between concurrent snapshot
+        // requests for different Hub channels on the shared TCP connection.
+        // Allow error responses through (they may use a different channelId).
+        if (
+          frame.header.channelId !== channelId &&
+          frame.header.responseCode < 400
+        ) {
+          return;
+        }
+
         // If the request itself was rejected, fail fast instead of timing out.
         // Some firmwares respond with an empty-body error for snapshot.
         if (
